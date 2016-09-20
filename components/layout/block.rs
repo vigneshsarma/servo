@@ -1841,8 +1841,13 @@ impl Flow for BlockFlow {
             let containing_block_block_size =
                 self.base.block_container_explicit_block_size;
             self.fragment.assign_replaced_block_size_if_necessary(containing_block_block_size);
+
+            // If this fragment is absolutely positioned, don't adjust the flow size. The
+            // `AbsoluteAssignBSizesTraversal` will take care of it.
             if !self.base.flags.contains(IS_ABSOLUTELY_POSITIONED) {
                 self.base.position.size.block = self.fragment.border_box.size.block;
+                self.fragment.restyle_damage.remove(REFLOW_OUT_OF_FLOW | REFLOW);
+                self.base.restyle_damage.remove(REFLOW_OUT_OF_FLOW | REFLOW);
             }
             None
         } else if self.is_root() || self.formatting_context_type() != FormattingContextType::None {
