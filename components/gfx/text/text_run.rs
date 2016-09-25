@@ -13,8 +13,8 @@ use std::slice::Iter;
 use std::sync::Arc;
 use style::str::char_is_whitespace;
 use text::glyph::{ByteIndex, GlyphStore};
+use unicode_segmentation::UnicodeSegmentation;
 use webrender_traits;
-use xi_unicode::LineBreakIterator;
 
 thread_local! {
     static INDEX_OF_FIRST_GLYPH_RUN_CACHE: Cell<Option<(*const TextRun, ByteIndex, usize)>> =
@@ -135,6 +135,53 @@ impl<'a> Iterator for NaturalWordSliceIterator<'a> {
     }
 }
 
+pub struct SoftWrapSliceIterator<'a> {
+    text: &'a str,
+    glyph_run: Option<&'a GlyphRun>,
+    glyph_run_iter: Iter<'a, GlyphRun>,
+    range: Range<ByteIndex>,
+}
+
+// This is like NaturalWordSliceIterator, except that soft-wrap opportunities
+// are allowed. That is, word boundaries are defined solely by UAX#29,
+// regardless of whether the sequence being broken into different slices is
+// a sequence of alphanumeric characters. This shouldn't make a difference in
+// the case of Latin text, but it does in ideographic characters, as well as
+// scripts such as Thai.
+impl<'a> Iterator for SoftWrapSliceIterator<'a> {
+    type Item = TextRunSlice<'a>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<TextRunSlice<'a>> {
+        let glyph_run = match self.glyph_run {
+            None => return None,
+            Some(glyph_run) => glyph_run,
+        };
+
+        let text_start = self.range.begin();
+        let text = &self.text[text_start.to_usize()..self.range.end().to_usize()];
+        let slice_text = match UnicodeSegmentation::split_word_bounds(text).next() {
+            Some(word) => word,
+            None => unreachable!()
+        };
+
+        let slice_len = ByteIndex(slice_text.len() as isize);
+        self.range.adjust_by(slice_len, -slice_len);
+        if self.range.is_empty() {
+            self.glyph_run = None
+        } else if self.range.intersect(&glyph_run.range).is_empty() {
+            self.glyph_run = self.glyph_run_iter.next();
+        }
+
+        let index_within_glyph_run = text_start - glyph_run.range.begin();
+        Some(TextRunSlice {
+            glyphs: &*glyph_run.glyph_store,
+            offset: glyph_run.range.begin(),
+            range: Range::new(index_within_glyph_run, slice_len),
+        })
+    }
+}
+
 pub struct CharacterSliceIterator<'a> {
     text: &'a str,
     glyph_run: Option<&'a GlyphRun>,
@@ -178,6 +225,52 @@ impl<'a> Iterator for CharacterSliceIterator<'a> {
     }
 }
 
+fn is_alphanumeric(c: &char) -> bool {
+    c.is_alphabetic() || c.is_numeric()
+}
+
+// Split on word boundaries, following UAX#29, and join sequences of alphanumeric characters.
+// This is so that glyph runs aren't split inside words, which otherwise would be possible
+// in e.g. Japanese and Chinese, as UAX#29 doesn't prohibit breaks in words in these scripts;
+// see issue #9673.
+fn split_on_word_boundaries_and_join_alphanumeric(text: &str) -> Vec<(usize, String)> {
+    let mut words = vec!();
+    let mut iter = UnicodeSegmentation::split_word_bound_indices(text);
+    let mut current = iter.next();
+    loop {
+        let mut last_of_current;
+        let mut word;
+        let idx;
+        match current {
+            Some((i, w)) => {
+                last_of_current = w.chars().last().unwrap();
+                idx = i;
+                word = String::from(w);
+            }
+            None => break,
+        }
+        loop {
+            let (next_idx, next) = match iter.next() {
+                Some((i, word)) => (i, word),
+                None => {
+                    current = None;
+                    break
+                },
+            };
+            let first_of_next = next.chars().next().unwrap();
+            if is_alphanumeric(&last_of_current) && is_alphanumeric(&first_of_next) {
+                word.push_str(next);
+                last_of_current = next.chars().last().unwrap();
+            } else {
+                current = Some((next_idx, next));
+                break;
+            }
+        }
+        words.push((idx, word));
+    }
+    words
+}
+
 impl<'a> TextRun {
     pub fn new(font: &mut Font, text: String, options: &ShapingOptions, bidi_level: u8) -> TextRun {
         let glyphs = TextRun::break_and_shape(font, &text, options);
@@ -198,10 +291,8 @@ impl<'a> TextRun {
         let mut glyphs = vec!();
         let mut slice = 0..0;
 
-        for (idx, _is_hard_break) in LineBreakIterator::new(text) {
-            // Extend the slice to the next UAX#14 line break opportunity.
-            slice.end = idx;
-            let word = &text[slice.clone()];
+        for (idx, word) in split_on_word_boundaries_and_join_alphanumeric(text).into_iter() {
+            slice.end = idx + word.len();
 
             // Split off any trailing whitespace into a separate glyph run.
             let mut whitespace = slice.end..slice.end;
@@ -340,6 +431,24 @@ impl<'a> TextRun {
             index: index,
             range: *range,
             reverse: reverse,
+        }
+    }
+
+    /// Returns an iterator that will iterate over all slices of glyphs that represent natural
+    /// words in the given range, where soft wrap opportunities are taken into account.
+    pub fn soft_wrap_slices_in_range(&'a self, range: &Range<ByteIndex>)
+                                        -> SoftWrapSliceIterator<'a> {
+        let index = match self.index_of_first_glyph_run_containing(range.begin()) {
+            None => self.glyphs.len(),
+            Some(index) => index,
+        };
+        let mut glyph_run_iter = self.glyphs[index..].iter();
+        let first_glyph_run = glyph_run_iter.next();
+        SoftWrapSliceIterator {
+            text: &self.text,
+            glyph_run: first_glyph_run,
+            glyph_run_iter: glyph_run_iter,
+            range: *range,
         }
     }
 

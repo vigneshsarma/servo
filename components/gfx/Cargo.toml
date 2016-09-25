@@ -45,7 +45,7 @@ time = "0.1.12"
 unicode-script = {version = "0.1", features = ["harfbuzz"]}
 url = {version = "1.2", features = ["heap_size"]}
 util = {path = "../util"}
-xi-unicode = "0.0.1"
+unicode-segmentation = "0.1.2"
 
 [dependencies.webrender_traits]
 git = "https://github.com/servo/webrender"
